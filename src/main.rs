@@ -1,13 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use regex::Regex;
 use std::{
     collections::HashMap,
     collections::HashSet,
-    env, fs, io,
+    env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+use streaming_iterator::StreamingIterator;
 use tree_sitter::{Parser, Query, QueryCursor};
 
 #[derive(Debug)]
@@ -102,7 +102,7 @@ fn load_gitignore(git_root: &Path) -> Result<Gitignore> {
 struct LanguageConfig {
     language: tree_sitter::Language,
     query: &'static str,
-} 
+}
 
 fn get_imports(file_path: &Path, project_ctx: &ProjectContext) -> Result<Vec<PathBuf>> {
     let content = fs::read_to_string(file_path)?;
@@ -115,24 +115,24 @@ fn get_imports(file_path: &Path, project_ctx: &ProjectContext) -> Result<Vec<Pat
 
     let config = match extension.as_str() {
         "py" => Some(LanguageConfig {
-            language: tree_sitter_python::language(),
+            language: tree_sitter_python::LANGUAGE.into(),
             query: r#"
-                (import_statement
-                    name: (dotted_name) @import)
-                (import_from_statement
-                    module_name: (dotted_name) @import)
-            "#,
+            (import_statement
+                name: (dotted_name) @import)
+            (import_from_statement
+                module_name: (dotted_name) @import)
+        "#,
         }),
         "js" | "ts" | "jsx" | "tsx" => Some(LanguageConfig {
-            language: tree_sitter_typescript::language(),
+            language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             query: r#"
-                (import_statement
-                    source: (string) @import)
-                (call_expression
-                    function: (identifier) @function
-                    arguments: (arguments (string) @import)
-                    (#eq? @function "require"))
-            "#,
+            (import_statement
+                source: (string) @import)
+            (call_expression
+                function: (identifier) @function
+                arguments: (arguments (string) @import)
+                (#eq? @function "require"))
+        "#,
         }),
         _ => None,
     };
@@ -142,35 +142,38 @@ fn get_imports(file_path: &Path, project_ctx: &ProjectContext) -> Result<Vec<Pat
     };
 
     let mut parser = Parser::new();
-    parser.set_language(config.language)?;
+parser.set_language(&config.language)?;
 
-    let tree = parser.parse(&content, None)
+    let tree = parser
+        .parse(&content, None)
         .ok_or_else(|| anyhow!("Failed to parse file"))?;
 
-    let query = Query::new(config.language, config.query)?;
+    let query = Query::new(&config.language, config.query)?;
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
+    let mut matches = cursor.matches(&query, tree.root_node(), content.as_bytes());
 
-    let imports = matches
-        .filter_map(|m| {
-            let capture = m.captures[0];
-            let import_text = capture.node.utf8_text(content.as_bytes()).ok()?;
-            
-            // Clean up the import text (remove quotes, etc)
-            let clean_import = import_text.trim_matches(|c| c == '"' || c == '\'' || c == '`');
-            
-            match extension.as_str() {
-                "py" => Some(resolve_python_import(clean_import, file_dir, &project_ctx.git_root)),
-                "js" | "ts" | "jsx" | "tsx" => {
-                    project_ctx.path_aliases
+    let mut imports = Vec::new();
+    while let Some(m) = matches.next() {
+        if let Some(capture) = m.captures.first() {
+            if let Ok(import_text) = capture.node.utf8_text(content.as_bytes()) {
+                // Clean up the import text (remove quotes, etc)
+                let clean_import = import_text.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+
+                let resolved_import = match extension.as_str() {
+                    "py" => resolve_python_import(clean_import, file_dir, &project_ctx.git_root),
+                    "js" | "ts" | "jsx" | "tsx" => project_ctx
+                        .path_aliases
                         .resolve_path(clean_import, file_dir)
-                        .or_else(|| Some(resolve_js_import(clean_import, file_dir)))
+                        .or_else(|| Some(resolve_js_import(clean_import, file_dir))),
+                    _ => None,
+                };
+
+                if let Some(path) = resolved_import {
+                    imports.push(path);
                 }
-                _ => None,
             }
-        })
-        .flatten()
-        .collect::<Vec<_>>();
+        }
+    }
 
     Ok(imports.into_iter().filter(|path| path.exists()).collect())
 }
@@ -185,7 +188,7 @@ fn resolve_python_import(import: &str, file_dir: &Path, git_root: &Path) -> Opti
 
 fn resolve_js_import(import: &str, file_dir: &Path) -> PathBuf {
     let base_path = file_dir.join(import);
-    
+
     // Return the base path - the existence check in get_imports will handle
     // checking various extensions and index files
     base_path
