@@ -158,6 +158,8 @@ parser.set_language(&config.language)?;
             if let Ok(import_text) = capture.node.utf8_text(content.as_bytes()) {
                 // Clean up the import text (remove quotes, etc)
                 let clean_import = import_text.trim_matches(|c| c == '"' || c == '\'' || c == '`');
+                
+                println!("Found import: {}", clean_import);
 
                 let resolved_import = match extension.as_str() {
                     "py" => resolve_python_import(clean_import, file_dir, &project_ctx.git_root),
@@ -169,7 +171,10 @@ parser.set_language(&config.language)?;
                 };
 
                 if let Some(path) = resolved_import {
+                    println!("Resolved to: {:?}", path);
                     imports.push(path);
+                } else {
+                    println!("Could not resolve import: {}", clean_import);
                 }
             }
         }
@@ -187,10 +192,37 @@ fn resolve_python_import(import: &str, file_dir: &Path, git_root: &Path) -> Opti
 }
 
 fn resolve_js_import(import: &str, file_dir: &Path) -> PathBuf {
-    let base_path = file_dir.join(import);
+    let base_path = if import.starts_with("@/") {
+        // Remove the '@/' prefix and resolve from git root
+        file_dir.ancestors()
+            .find(|p| p.join(".git").is_dir())
+            .unwrap_or(file_dir)
+            .join(&import[2..])
+    } else {
+        file_dir.join(import)
+    };
 
-    // Return the base path - the existence check in get_imports will handle
-    // checking various extensions and index files
+    // Try different extensions and index file combinations
+    let possible_paths = vec![
+        base_path.with_extension("ts"),
+        base_path.with_extension("tsx"),
+        base_path.with_extension("js"),
+        base_path.with_extension("jsx"),
+        base_path.join("index.ts"),
+        base_path.join("index.tsx"),
+        base_path.join("index.js"),
+        base_path.join("index.jsx"),
+        base_path.clone(),
+    ];
+
+    // Return the first path that exists
+    for path in possible_paths {
+        if path.exists() {
+            return path;
+        }
+    }
+
+    // If no path exists, return the base path (the caller will handle the non-existence)
     base_path
 }
 
